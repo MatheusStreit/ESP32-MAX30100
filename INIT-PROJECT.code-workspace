@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"name": "INIT-PROJECT",
+			"path": "."
+		},
+		{
+			"name": "serial:/COM5",
+			"uri": "serial://com5/"
+		}
+	],
+	"settings": {}
+}

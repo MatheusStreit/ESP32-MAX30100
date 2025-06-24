@@ -1,131 +1,171 @@
-import network
-import socket
-from machine import Pin, I2C
 from time import sleep, ticks_ms, ticks_diff
-from max30100 import MAX30100
+from machine import Pin, I2C, reset
+import max30100
+import urequests
+import gc
+import network
+import sys
 
-# ========= CONFIG Wi-Fi =========
-SSID = 'BUDD_VISITANTES'
-SENHA = 'budd3m3y3r@1951'
+# --- Wi-Fi ---
+WIFI_SSID = "moto_g54"
+WIFI_PASSWORD = "motorola"
 
-print("Conectando ao Wi-Fi...")
-wifi = network.WLAN(network.STA_IF)
-wifi.active(True)
-wifi.connect(SSID, SENHA)
+def conectar_wifi():
+    wlan = network.WLAN(network.STA_IF)
+    if not wlan.isconnected():
+        print('[INFO] Conectando ao Wi-Fi...')
+        wlan.active(True)
+        wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+        tentativas = 0
+        while not wlan.isconnected() and tentativas < 15:
+            sleep(1)
+            tentativas += 1
+        if not wlan.isconnected():
+            print('[ERRO] Falha ao conectar no Wi-Fi.')
+            return None
+    print('[INFO] Conectado. IP:', wlan.ifconfig()[0])
+    return wlan
 
-while not wifi.isconnected():
-    sleep(0.5)
-print("Conectado! IP:", wifi.ifconfig()[0])
+wlan = conectar_wifi()
+if wlan is None:
+    raise RuntimeError("Wi-Fi não conectado")
 
-# ========= SENSOR =========
+# --- MAC do monitor ---
+mac_bytes = wlan.config('mac')
+mac_address = ':'.join(['%02X' % b for b in mac_bytes])
+print("[INFO] MAC:", mac_address)
+
+# --- Configurações ---
+SERVER_URL = "http://192.168.179.103:5000/api/atualizar"
+DURACAO_COLETA_MS = 6000
+INTERVALO_LEITURA = 0.25  # segundos
+
+# --- Timer para reinício automático ---
+TEMPO_REINICIO_MS = 5 * 60 * 1000  # 5 minutos
+ultimo_reinicio = ticks_ms()
+
+# --- Sensor ---
 i2c = I2C(0, scl=Pin(22), sda=Pin(21))
-sensor = MAX30100(i2c=i2c)
-sensor.set_led_current(27.1, 27.1)
+sensor = None
 
-red_buffer = []
-ir_buffer = []
-bpm_buffer = []
+def inicializar_sensor():
+    global sensor
+    try:
+        sensor = max30100.MAX30100(i2c=i2c)
+        sensor.set_led_current(14.2, 14.2)
+        sensor.enable_spo2()
+        print("[INFO] Sensor MAX30100 inicializado.")
+    except Exception as e:
+        print(f"[ERRO] Falha ao inicializar sensor: {e}")
+        sensor = None
 
-ultimo_valor_ir = 0
-penultimo_valor_ir = 0
-last_peak_time = None
+inicializar_sensor()
 
-bpm = 0
-oxigenacao = 0
+# --- Funções auxiliares ---
+def detectar_picos(dados_ir):
+    picos = []
+    for i in range(1, len(dados_ir) - 1):
+        ir_anterior = dados_ir[i - 1][0]
+        ir_atual = dados_ir[i][0]
+        ir_proximo = dados_ir[i + 1][0]
+        if ir_atual > ir_anterior and ir_atual > ir_proximo:
+            picos.append(dados_ir[i][1])  # timestamp do pico
+    return picos
 
-# Ajuste para detecção de pico
-PICO_LIMIAR = 500
+def calcular_bpm(picos):
+    if len(picos) < 2:
+        return None
+    intervalos = [ticks_diff(picos[i + 1], picos[i]) for i in range(len(picos) - 1)]
+    media_intervalo = sum(intervalos) / len(intervalos)
+    bpm = 60000 / media_intervalo
+    return round(bpm)
 
-# Função de média móvel
-def media_movel(buffer, novo_valor, tamanho):
-    buffer.append(novo_valor)
-    if len(buffer) > tamanho:
-        buffer.pop(0)
-    return sum(buffer) / len(buffer)
+def calcular_spo2(amostras):
+    valores_spo2 = []
+    for ir, red, _ in amostras:
+        if ir == 0:
+            continue
+        razao = red / ir
+        spo2 = 110 - 25 * razao
+        valores_spo2.append(spo2)
+    if not valores_spo2:
+        return None
+    media_spo2 = sum(valores_spo2) / len(valores_spo2)
+    return max(0, min(100, round(media_spo2)))
 
-# Função para detectar pico melhorada
-def detectar_pico(valor_atual, ultimo_valor, penultimo_valor):
-    return (penultimo_valor < ultimo_valor > valor_atual) and (ultimo_valor - penultimo_valor > PICO_LIMIAR)
-
-# ========= WEB SERVER =========
-html = """<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>Monitor de Saúde - ESP32</title>
-    <meta http-equiv="refresh" content="1">
-    <style>
-        body {{ font-family: Arial; text-align: center; }}
-        .card {{
-            display: inline-block;
-            background: #f2f2f2;
-            padding: 20px;
-            margin-top: 40px;
-            border-radius: 15px;
-            box-shadow: 2px 2px 12px #aaa;
-        }}
-        h1 {{ color: #333; }}
-        h2 {{ color: #0077cc; }}
-    </style>
-</head>
-<body>
-    <div class="card">
-        <h1>💓 Monitor de Saúde - ESP32</h1>
-        <h2>BPM: {bpm:.0f}</h2>
-        <h2>Oxigenação: {spo2:.2f}</h2>
-    </div>
-</body>
-</html>
-"""
-
-# Cria socket web
-addr = socket.getaddrinfo('0.0.0.0', 80)[0][-1]
-s = socket.socket()
-s.bind(addr)
-s.listen(1)
-print("Servidor iniciado em http://{}/".format(wifi.ifconfig()[0]))
-
-# ========= LOOP principal =========
+# --- Loop principal ---
 while True:
     try:
-        # ===== Sensor Reading =====
-        sensor.read_sensor()
-        red = media_movel(red_buffer, sensor.red, 10)
-        ir = media_movel(ir_buffer, sensor.ir, 10)
-        oxigenacao = red / ir if ir != 0 else 0
-        
-        print(f"IR: {ir}, Red: {red}")
-        print(f"Último IR: {ultimo_valor_ir}, Penúltimo IR: {penultimo_valor_ir}")
-        
-        if detectar_pico(ir, ultimo_valor_ir, penultimo_valor_ir):
-            agora = ticks_ms()
-            if last_peak_time is not None:
-                intervalo = ticks_diff(agora, last_peak_time)
-                if 300 < intervalo < 2000:  # Frequência entre 30 e 200 BPM
-                    bpm_inst = 60000 / intervalo
-                    bpm_buffer.append(bpm_inst)
-                    if len(bpm_buffer) > 5:
-                        bpm_buffer.pop(0)
-                    print(f"Pico detectado! BPM instantâneo: {bpm_inst}")
-            last_peak_time = agora
-        
-        penultimo_valor_ir = ultimo_valor_ir
-        ultimo_valor_ir = ir
-        
-        bpm = sum(bpm_buffer) / len(bpm_buffer) if bpm_buffer else 0
-        print(f"BPM final exibido: {bpm:.2f}")
-        
-        # ===== Web Server Response =====
-        conn, addr = s.accept()
-        print("Cliente conectado:", addr)
-        request = conn.recv(1024)
-        response = html.format(bpm=bpm, spo2=oxigenacao)
-        conn.send("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n")
-        conn.sendall(response)
-        conn.close()
+        # Verificação de tempo para reinício automático
+        if ticks_diff(ticks_ms(), ultimo_reinicio) > TEMPO_REINICIO_MS:
+            print("[INFO] Reiniciando ESP32 para liberar memória...")
+            sleep(1)
+            reset()
 
-        sleep(0.1)
+        if sensor is None:
+            inicializar_sensor()
+            if sensor is None:
+                sleep(2)
+                continue
+
+        amostras = []
+        inicio = ticks_ms()
+
+        # Coleta de dados por 6 segundos
+        while ticks_diff(ticks_ms(), inicio) < DURACAO_COLETA_MS:
+            sensor.read_sensor()
+            ir = sensor.ir
+            red = sensor.red
+            agora = ticks_ms()
+            if ir > 5000:
+                amostras.append((ir, red, agora))
+                if len(amostras) > 100:
+                    amostras.pop(0)
+            sleep(INTERVALO_LEITURA)
+            gc.collect()
+
+        if len(amostras) < 10:
+            print("[WARN] Poucas amostras coletadas, ignorando ciclo.")
+            del amostras
+            gc.collect()
+            continue
+
+        dados_ir_com_tempo = [(am[0], am[2]) for am in amostras]
+        picos = detectar_picos(dados_ir_com_tempo)
+        bpm = calcular_bpm(picos)
+        spo2 = calcular_spo2(amostras)
+
+        print(f"[INFO] BPM={bpm}, SpO2={spo2}%")
+
+        if bpm is not None and spo2 is not None:
+            payload = {
+                "mac": mac_address,
+                "batimento": bpm,
+                "spo2": spo2
+            }
+
+            try:
+                gc.collect()
+                headers = {'Content-Type': 'application/json'}
+                resposta = urequests.post(SERVER_URL, json=payload, headers=headers)
+                if resposta.status_code == 200:
+                    print("[INFO] Dados enviados com sucesso.")
+                else:
+                    print(f"[ERRO] Resposta do servidor: {resposta.status_code}")
+            except Exception as erro_envio:
+                print(f"[ERRO] Falha ao enviar dados: {erro_envio}")
+            finally:
+                try:
+                    resposta.close()
+                except:
+                    pass
+                gc.collect()
+
+        # Limpeza de variáveis
+        del amostras, dados_ir_com_tempo, picos, bpm, spo2, payload
+        gc.collect()
 
     except Exception as e:
-        print("Erro:", e)
+        sys.print_exception(e)
+        gc.collect()
         sleep(1)
